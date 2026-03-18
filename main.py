@@ -5,6 +5,7 @@ import os
 import json
 import logging
 from openai import AsyncOpenAI
+from urllib.parse import parse_qs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -130,6 +131,23 @@ async def send_candidate_card(dialog_id, conversation):
         })
 
 
+def parse_bitrix_form(data: dict) -> dict:
+    """Parse Bitrix24 form-data with nested keys like auth[access_token]."""
+    result = {}
+    for key, value in data.items():
+        if "[" in key:
+            parts = key.replace("]", "").split("[")
+            current = result
+            for i, part in enumerate(parts[:-1]):
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+            current[parts[-1]] = value
+        else:
+            result[key] = value
+    return result
+
+
 async def parse_request_body(request: Request):
     """Parse request body - handles both JSON and form-data."""
     content_type = request.headers.get("content-type", "")
@@ -179,10 +197,9 @@ async def install_get(request: Request):
     if "access_token" in data:
         tokens["access_token"] = data["access_token"]
         tokens["refresh_token"] = data["refresh_token"]
-        # Register event handler for open lines messages
         result = await bitrix_call("event.bind", {
             "event": "ONIMBOTMESSAGEADD",
-            "handler": f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME', 'ai-recruiter-avito.onrender.com')}/webhook"
+            "handler": f"https://ai-recruiter-avito.onrender.com/webhook"
         })
         logger.info(f"Event bind result: {result}")
         return HTMLResponse("<h1>App installed successfully!</h1>")
@@ -191,57 +208,58 @@ async def install_get(request: Request):
 
 @app.post("/install")
 async def install_post(request: Request):
-    body = await parse_request_body(request)
-    logger.info(f"Install POST body: {json.dumps(body, default=str, ensure_ascii=False)[:500]}")
-    # Bitrix sends AUTH_ID in form-data during install
-    auth_id = body.get("AUTH_ID") or body.get("auth_id")
-    refresh_id = body.get("REFRESH_ID") or body.get("refresh_id")
-    if auth_id:
-        tokens["access_token"] = auth_id
-        if refresh_id:
-            tokens["refresh_token"] = refresh_id
-        logger.info(f"Tokens saved from install POST. Auth: {auth_id[:10]}...")
-        # Register event handler
+    raw_body = await parse_request_body(request)
+    logger.info(f"Install POST raw body: {json.dumps(raw_body, default=str, ensure_ascii=False)[:500]}")
+    # Parse nested keys like auth[access_token]
+    body = parse_bitrix_form(raw_body)
+    logger.info(f"Install POST parsed body: {json.dumps(body, default=str, ensure_ascii=False)[:500]}")
+    # Bitrix sends auth data in nested format: auth[access_token], auth[refresh_token]
+    auth_data = body.get("auth", {})
+    access_token = None
+    refresh_token = None
+    if isinstance(auth_data, dict):
+        access_token = auth_data.get("access_token")
+        refresh_token = auth_data.get("refresh_token")
+    # Also try flat format
+    if not access_token:
+        access_token = body.get("AUTH_ID") or body.get("auth_id")
+        refresh_token = body.get("REFRESH_ID") or body.get("refresh_id")
+    if access_token:
+        tokens["access_token"] = access_token
+        if refresh_token:
+            tokens["refresh_token"] = refresh_token
+        logger.info(f"Tokens saved. Access token: {access_token[:10]}...")
+        # Register event handler for open lines messages
         result = await bitrix_call("event.bind", {
             "event": "ONIMBOTMESSAGEADD",
-            "handler": f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME', 'ai-recruiter-avito.onrender.com')}/webhook"
+            "handler": "https://ai-recruiter-avito.onrender.com/webhook"
         })
         logger.info(f"Event bind result: {result}")
         return JSONResponse({"status": "ok"})
-    # Try code-based auth
-    code = body.get("code")
-    if code:
-        async with httpx.AsyncClient() as client_http:
-            resp = await client_http.get(
-                "https://oauth.bitrix.info/oauth/token/",
-                params={
-                    "grant_type": "authorization_code",
-                    "client_id": BITRIX_CLIENT_ID,
-                    "client_secret": BITRIX_CLIENT_SECRET,
-                    "code": code
-                }
-            )
-            data = resp.json()
-            if "access_token" in data:
-                tokens["access_token"] = data["access_token"]
-                tokens["refresh_token"] = data["refresh_token"]
-                return JSONResponse({"status": "ok"})
-    return JSONResponse({"status": "received", "body_keys": list(body.keys())})
+    return JSONResponse({"status": "received", "body_keys": list(raw_body.keys())})
 
 
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
-        body = await parse_request_body(request)
+        raw_body = await parse_request_body(request)
+        body = parse_bitrix_form(raw_body)
         logger.info(f"Webhook received: {json.dumps(body, default=str, ensure_ascii=False)[:500]}")
 
-        # Handle event verification
-        if body.get("event") == "ONIMBOTMESSAGEADD" or "data" in body:
-            data = body.get("data", body)
+        # Refresh auth if provided
+        auth_data = body.get("auth", {})
+        if isinstance(auth_data, dict) and auth_data.get("access_token"):
+            tokens["access_token"] = auth_data["access_token"]
+            if auth_data.get("refresh_token"):
+                tokens["refresh_token"] = auth_data["refresh_token"]
+
+        event = body.get("event", "")
+        data = body.get("data", {})
+
+        if event == "ONIMBOTMESSAGEADD" or "PARAMS" in data:
             params = data.get("PARAMS", data)
             dialog_id = str(params.get("DIALOG_ID", params.get("dialog_id", "")))
             message = params.get("MESSAGE", params.get("message", ""))
-            from_user = params.get("FROM_USER_ID", params.get("from_user_id", ""))
 
             if not message or not dialog_id:
                 return JSONResponse({"status": "no message"})
@@ -265,9 +283,9 @@ async def webhook(request: Request):
 
             return JSONResponse({"status": "ok"})
 
-        return JSONResponse({"status": "unknown event", "body": str(body)[:200]})
+        return JSONResponse({"status": "unknown event", "event": event, "keys": list(body.keys())})
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"Webhook error: {e}", exc_info=True)
         return JSONResponse({"status": "error", "message": str(e)})
 
 
