@@ -23,8 +23,9 @@ BITRIX_CLIENT_SECRET = os.getenv("BITRIX_CLIENT_SECRET")
 BITRIX_DOMAIN = os.getenv("BITRIX_DOMAIN")
 DISPATCHER_CHAT_ID = os.getenv("DISPATCHER_CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "18mMtxAzU_3kP8oTjukJBUm9OcGc2FP7zr-We5F-Abqs")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL) if OPENAI_API_KEY else None
 
 # Хранилище токенов Bitrix24 (в памяти)
 tokens: Dict[str, str] = {}
