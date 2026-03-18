@@ -1,31 +1,32 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, HTMLResponse
-import httpx
 import os
-import json
 import logging
+from typing import Dict, List, Any
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+import httpx
 from openai import AsyncOpenAI
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+app = FastAPI(title="AI Recruiter Avito")
 
-# Environment variables
-BITRIX_CLIENT_ID = os.getenv("BITRIX_CLIENT_ID", "")
-BITRIX_CLIENT_SECRET = os.getenv("BITRIX_CLIENT_SECRET", "")
-BITRIX_PORTAL = os.getenv("BITRIX_PORTAL", "svoya-disp.bitrix24.ru")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-DISPATCHER_CHAT_ID = os.getenv("DISPATCHER_CHAT_ID", "")
-WEBHOOK_URL = "https://ai-recruiter-avito.onrender.com/webhook"
+# Настройки из переменных окружения
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+WAZZUP_API_KEY = os.getenv("WAZZUP_API_KEY")
+WAZZUP_CHANNEL_ID = os.getenv("WAZZUP_CHANNEL_ID")
+BITRIX_CLIENT_ID = os.getenv("BITRIX_CLIENT_ID")
+BITRIX_CLIENT_SECRET = os.getenv("BITRIX_CLIENT_SECRET")
+BITRIX_PORTAL = os.getenv("BITRIX_PORTAL")
+DISPATCHER_CHAT_ID = os.getenv("DISPATCHER_CHAT_ID")
 
-# Token storage
-tokens = {}
-# Dialog memory
-dialogs = {}
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+# Хранилище токенов Bitrix24 (в памяти)
+tokens: Dict[str, str] = {}
 
+# Хранилище контекста диалогов (в памяти)
+dialogs: Dict[str, List[Dict[str, str]]] = {}
 SYSTEM_PROMPT = """Ты ИИ-рекрутер компании 'Своя Диспетчерская'. Твоя задача — провести предварительное собеседование с кандидатами, которые откликнулись на вакансию на Авито.
 Правила:
 - Общайся только на русском языке
@@ -45,254 +46,180 @@ SYSTEM_PROMPT = """Ты ИИ-рекрутер компании 'Своя Дис�
 Если кандидат задаёт вопросы не по теме — вежливо верни к собеседованию.
 Если кандидат говорит, что не заинтересован — поблагодари и попрощайся."""
 
-
-def parse_bitrix_form(data: dict) -> dict:
-    """Parse Bitrix24 form-data with nested keys like auth[access_token]."""
-    result = {}
-    for key, value in data.items():
-        if "[" in key:
-            parts = key.replace("]", "").split("[")
-            current = result
-            for part in parts[:-1]:
-                if part not in current:
-                    current[part] = {}
-                current = current[part]
-            current[parts[-1]] = value
-        else:
-            result[key] = value
-    return result
-
-
-async def parse_request_body(request: Request):
-    """Parse request body - handle both JSON and form data."""
-    content_type = request.headers.get("content-type", "")
-    if "json" in content_type:
-        try:
-            return await request.json()
-        except Exception:
-            pass
-    try:
-        form = await request.form()
-        return dict(form)
-    except Exception:
-        pass
-    try:
-        body = await request.body()
-        return {"raw": body.decode("utf-8", errors="replace")}
-    except Exception:
-        return {}
-
-
-async def refresh_tokens():
-    if "refresh_token" not in tokens:
-        return False
-    async with httpx.AsyncClient() as c:
-        resp = await c.get(
-            "https://oauth.bitrix.info/oauth/token/",
-            params={
-                "grant_type": "refresh_token",
-                "client_id": BITRIX_CLIENT_ID,
-                "client_secret": BITRIX_CLIENT_SECRET,
-                "refresh_token": tokens["refresh_token"]
-            }
-        )
-        data = resp.json()
-        if "access_token" in data:
-            tokens["access_token"] = data["access_token"]
-            tokens["refresh_token"] = data["refresh_token"]
-            return True
-    return False
-
-
-async def bitrix_call(method, params=None):
-    token = tokens.get("access_token")
-    if not token:
-        logger.error("No access token")
-        return None
-    async with httpx.AsyncClient(timeout=30) as c:
-        resp = await c.post(
-            f"https://{BITRIX_PORTAL}/rest/{method}",
-            params={"auth": token},
-            json=params or {}
-        )
-        data = resp.json()
-        if data.get("error") == "expired_token":
-            if await refresh_tokens():
-                token = tokens.get("access_token")
-                resp = await c.post(
-                    f"https://{BITRIX_PORTAL}/rest/{method}",
-                    params={"auth": token},
-                    json=params or {}
-                )
-                data = resp.json()
-        logger.info(f"bitrix_call {method}: {json.dumps(data, ensure_ascii=False)[:300]}")
-        return data
-
-
-async def get_gpt_response(dialog_id, user_message):
-    if dialog_id not in dialogs:
-        dialogs[dialog_id] = []
-    dialogs[dialog_id].append({"role": "user", "content": user_message})
-    if len(dialogs[dialog_id]) > 20:
-        dialogs[dialog_id] = dialogs[dialog_id][-20:]
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + dialogs[dialog_id]
-    response = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        max_tokens=500,
-        temperature=0.7
-    )
-    assistant_msg = response.choices[0].message.content
-    dialogs[dialog_id].append({"role": "assistant", "content": assistant_msg})
-    logger.info(f"GPT response for {dialog_id}: {assistant_msg[:200]}")
-    return assistant_msg
-
-
-async def send_candidate_card(dialog_id, conversation):
-    card_text = "[B]Новый кандидат с Авито[/B]\n\n"
-    for msg in conversation:
-        if msg["role"] == "user":
-            card_text += f"Кандидат: {msg['content']}\n"
-        elif msg["role"] == "assistant":
-            card_text += f"Бот: {msg['content']}\n"
-    card_text += f"\nID диалога: {dialog_id}"
-    if DISPATCHER_CHAT_ID:
-        await bitrix_call("im.message.add", {
-            "DIALOG_ID": DISPATCHER_CHAT_ID,
-            "MESSAGE": card_text
-        })
-
-
-async def bind_events():
-    """Register event handlers after installation."""
-    result = await bitrix_call("event.bind", {
-        "event": "OnOpenLineMessageAdd",
-        "handler": WEBHOOK_URL
-    })
-    logger.info(f"Bind OnOpenLineMessageAdd: {result}")
-
-
 @app.get("/")
 async def root():
-    return {"status": "ok", "app": "AI Recruiter Avito", "tokens": bool(tokens.get("access_token"))}
-
-
-@app.get("/install")
-async def install_get(request: Request):
-    code = request.query_params.get("code")
-    if not code:
-        return HTMLResponse("<h1>Install: no code provided</h1>")
-    async with httpx.AsyncClient() as c:
-        resp = await c.get(
-            "https://oauth.bitrix.info/oauth/token/",
-            params={
-                "grant_type": "authorization_code",
-                "client_id": BITRIX_CLIENT_ID,
-                "client_secret": BITRIX_CLIENT_SECRET,
-                "code": code
-            }
-        )
-        data = resp.json()
-        logger.info(f"Install GET: {data}")
-        if "access_token" in data:
-            tokens["access_token"] = data["access_token"]
-            tokens["refresh_token"] = data["refresh_token"]
-            await bind_events()
-            return HTMLResponse("<h1>App installed successfully!</h1>")
-    return HTMLResponse(f"<h1>Install error</h1><pre>{json.dumps(data, indent=2)}</pre>")
-
-
-@app.post("/install")
-async def install_post(request: Request):
-    raw = await parse_request_body(request)
-    body = parse_bitrix_form(raw)
-    logger.info(f"Install POST: {json.dumps(body, default=str, ensure_ascii=False)[:600]}")
-
-    auth = body.get("auth", {})
-    access_token = auth.get("access_token") if isinstance(auth, dict) else None
-    refresh_token = auth.get("refresh_token") if isinstance(auth, dict) else None
-
-    if not access_token:
-        access_token = body.get("AUTH_ID") or body.get("auth_id")
-        refresh_token = body.get("REFRESH_ID") or body.get("refresh_id")
-
-    if access_token:
-        tokens["access_token"] = access_token
-        if refresh_token:
-            tokens["refresh_token"] = refresh_token
-        logger.info(f"Token saved: {access_token[:15]}...")
-        await bind_events()
-        return JSONResponse({"status": "ok"})
-
-    return JSONResponse({"status": "received", "keys": list(raw.keys())})
-
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    try:
-        raw = await parse_request_body(request)
-        body = parse_bitrix_form(raw)
-        logger.info(f"Webhook: {json.dumps(body, default=str, ensure_ascii=False)[:800]}")
-
-        # Always update tokens from webhook auth if provided
-        auth = body.get("auth", {})
-        if isinstance(auth, dict) and auth.get("access_token"):
-            tokens["access_token"] = auth["access_token"]
-            if auth.get("refresh_token"):
-                tokens["refresh_token"] = auth["refresh_token"]
-
-        event = body.get("event", "").upper()
-        data = body.get("data", {})
-
-        if event == "ONOPENLINEMESSAGEADD":
-            # Wazzup structure: data.DATA.connector, data.DATA.message
-            inner = data.get("DATA", data)  # try DATA first, fallback to data itself
-            
-            connector = inner.get("connector", {})
-            msg_data = inner.get("message", {})
-            chat_data = inner.get("chat", {})
-            
-            # Extract chat_id as dialog_id
-            dialog_id = connector.get("chat_id") or chat_data.get("id", "")
-            message_text = msg_data.get("text", "")
-            user_id = msg_data.get("user_id") or connector.get("user_id", "")
-            line_id = connector.get("line_id", "")
-            
-            logger.info(f"OpenLine message - dialog_id: {dialog_id}, text: {message_text}, user_id: {user_id}, line_id: {line_id}")
-
-            if not message_text or not dialog_id:
-                logger.info(f"No message or dialog_id. inner keys: {list(inner.keys())}")
-                return JSONResponse({"status": "no_data"})
-
-            gpt_response = await get_gpt_response(dialog_id, message_text)
-
-            if "[CANDIDATE_READY]" in gpt_response:
-                clean = gpt_response.replace("[CANDIDATE_READY]", "").strip()
-                await bitrix_call("imopenlines.message.add", {
-                    "DIALOG_ID": dialog_id,
-                    "MESSAGE": clean
-                })
-                await send_candidate_card(dialog_id, dialogs.get(dialog_id, []))
-            else:
-                await bitrix_call("imopenlines.message.add", {
-                    "DIALOG_ID": dialog_id,
-                    "MESSAGE": gpt_response
-                })
-
-            return JSONResponse({"status": "ok"})
-
-        logger.info(f"Unknown event: {event}, keys: {list(body.keys())}")
-        return JSONResponse({"status": "unknown", "event": event})
-
-    except Exception as e:
-        logger.error(f"Webhook error: {e}", exc_info=True)
-        return JSONResponse({"status": "error", "message": str(e)})
-
+    return {"status": "ok", "message": "AI Recruiter Avito is running"}
 
 @app.get("/health")
 async def health():
     return {
-        "status": "healthy",
-        "has_token": bool(tokens.get("access_token")),
-        "dialogs_count": len(dialogs)
+        "status": "ok",
+        "openai_configured": bool(OPENAI_API_KEY),
+        "wazzup_configured": bool(WAZZUP_API_KEY and WAZZUP_CHANNEL_ID),
+        "bitrix_configured": bool(BITRIX_PORTAL and DISPATCHER_CHAT_ID)
     }
+
+@app.post("/install")
+async def install(request: Request):
+    data = await request.form()
+    auth_id = data.get("auth[access_token]")
+    refresh_id = data.get("auth[refresh_token]")
+    if auth_id:
+        tokens["access_token"] = auth_id
+        tokens["refresh_token"] = refresh_id
+        logger.info("Bitrix24 tokens updated via /install")
+    return {"status": "installed"}
+
+@app.get("/install")
+async def install_get(request: Request):
+    return {"status": "Use POST for installation"}
+
+@app.post("/webhook")
+async def old_webhook(request: Request):
+    return {"status": "deprecated, use /wazzup-webhook"}
+async def send_wazzup_message(chat_id: str, text: str):
+    if not WAZZUP_API_KEY or not WAZZUP_CHANNEL_ID:
+        logger.error("Wazzup credentials not configured")
+        return
+    
+    if len(text) > 1000:
+        text = text[:997] + "..."
+        
+    url = "https://api.wazzup24.com/v3/message"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {WAZZUP_API_KEY}"
+    }
+    payload = {
+        "channelId": WAZZUP_CHANNEL_ID,
+        "chatType": "avito",
+        "chatId": chat_id,
+        "text": text
+    }
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            logger.info(f"Message sent to Wazzup chat {chat_id}")
+        except Exception as e:
+            logger.error(f"Error sending message to Wazzup: {e}")
+
+async def send_candidate_card_to_bitrix(chat_id: str, candidate_name: str, dialog_history: str):
+    if not BITRIX_PORTAL or not DISPATCHER_CHAT_ID or "access_token" not in tokens:
+        logger.error("Bitrix24 not configured or token missing")
+        return
+        
+    # Исправлен баг: добавлен протокол https://
+    url = f"https://{BITRIX_PORTAL}/rest/im.message.add.json"
+    
+    message = f"Новый кандидат с Авито!
+Имя: {candidate_name}
+Чат ID: {chat_id}
+
+История диалога:
+{dialog_history}"
+    
+    payload = {
+        "auth": tokens["access_token"],
+        "DIALOG_ID": DISPATCHER_CHAT_ID,
+        "MESSAGE": message
+    }
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+            logger.info("Candidate card sent to Bitrix24 dispatcher")
+        except Exception as e:
+            logger.error(f"Error sending candidate card to Bitrix24: {e}")
+async def process_wazzup_message(message: Dict[str, Any]):
+    is_echo = message.get("isEcho", True)
+    if is_echo:
+        return
+        
+    chat_id = message.get("chatId")
+    text = message.get("text", "")
+    contact = message.get("contact", {})
+    
+    # Изначальное имя из контакта Wazzup (может быть "Кандидат" или "User")
+    candidate_name = contact.get("name", "Кандидат")
+    
+    if not chat_id or not text:
+        return
+        
+    logger.info(f"Received message from {chat_id}: {text}")
+    
+    if chat_id not in dialogs:
+        dialogs[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        
+    dialogs[chat_id].append({"role": "user", "content": text})
+    
+    if len(dialogs[chat_id]) > 21:
+        dialogs[chat_id] = [dialogs[chat_id][0]] + dialogs[chat_id][-20:]
+        
+    if not openai_client:
+        logger.error("OpenAI client not initialized")
+        return
+        
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=dialogs[chat_id],
+            max_tokens=500,
+            temperature=0.7
+        )
+        
+        reply_text = response.choices[0].message.content
+        
+        dialogs[chat_id].append({"role": "assistant", "content": reply_text})
+        
+        is_ready = "[CANDIDATE_READY]" in reply_text
+        clean_reply = reply_text.replace("[CANDIDATE_READY]", "").strip()
+        
+        if clean_reply:
+            await send_wazzup_message(chat_id, clean_reply)
+            
+        if is_ready:
+            # Попытка извлечь имя из диалога (обычно это первый или второй ответ пользователя)
+            extracted_name = candidate_name
+            user_messages = [m["content"] for m in dialogs[chat_id] if m["role"] == "user"]
+            
+            if len(user_messages) >= 2:
+                # Если первый ответ был просто "Привет", имя скорее всего во втором ответе
+                # Но если в первом ответе больше 2 слов, возможно имя там
+                if len(user_messages[0].split()) > 2:
+                    extracted_name = user_messages[0]
+                else:
+                    extracted_name = user_messages[1]
+            elif len(user_messages) == 1:
+                extracted_name = user_messages[0]
+            
+            # Ограничиваем длину имени для карточки
+            extracted_name = extracted_name[:100].strip()
+
+            history_str = ""
+            for msg in dialogs[chat_id][1:]:
+                role = "Кандидат" if msg["role"] == "user" else "ИИ Рекрутер"
+                content = msg["content"].replace("[CANDIDATE_READY]", "")
+                history_str += f"{role}: {content}
+"
+                
+            await send_candidate_card_to_bitrix(chat_id, extracted_name, history_str)
+            
+    except Exception as e:
+        logger.error(f"Error processing message with OpenAI: {e}")
+
+@app.post("/wazzup-webhook")
+async def wazzup_webhook(request: Request, background_tasks: BackgroundTasks):
+    try:
+        data = await request.json()
+        messages = data.get("messages", [])
+        
+        for msg in messages:
+            background_tasks.add_task(process_wazzup_message, msg)
+            
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Error in wazzup_webhook: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
