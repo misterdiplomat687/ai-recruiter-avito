@@ -5,7 +5,6 @@ import os
 import json
 import logging
 from openai import AsyncOpenAI
-from urllib.parse import parse_qs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,45 +17,77 @@ BITRIX_CLIENT_SECRET = os.getenv("BITRIX_CLIENT_SECRET", "")
 BITRIX_PORTAL = os.getenv("BITRIX_PORTAL", "svoya-disp.bitrix24.ru")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 DISPATCHER_CHAT_ID = os.getenv("DISPATCHER_CHAT_ID", "")
+WEBHOOK_URL = "https://ai-recruiter-avito.onrender.com/webhook"
 
-# Token storage (in-memory, use DB in production)
+# Token storage
 tokens = {}
 # Dialog memory
 dialogs = {}
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-SYSTEM_PROMPT = """You are an AI recruiter for the company 'Svoya Dispetcherskaya'. Your task is to conduct a preliminary interview with candidates who responded to a job posting on Avito.
-Rules:
-- Communicate in Russian only
-- Be friendly and professional
-- Ask questions ONE AT A TIME, wait for answer before next question
-- Questions to ask in order:
-  1. What is your name?
-  2. How old are you?
-  3. Where do you live (city)?
-  4. Do you have experience as a dispatcher/operator?
-  5. Are you ready to work in shifts (day/night)?
-  6. When can you start?
-After all questions are answered:
-- Thank the candidate
-- Say you will pass the information to the manager
-- In your LAST message, add a special marker at the very end: [CANDIDATE_READY]
-If the candidate asks off-topic questions, politely redirect to the interview.
-If the candidate says they are not interested, thank them and say goodbye."""
+SYSTEM_PROMPT = """Ты ИИ-рекрутер компании 'Своя Диспетчерская'. Твоя задача — провести предварительное собеседование с кандидатами, которые откликнулись на вакансию на Авито.
+Правила:
+- Общайся только на русском языке
+- Будь дружелюбным и профессиональным
+- Задавай вопросы ПО ОДНОМУ, жди ответа перед следующим вопросом
+- Вопросы задавай в таком порядке:
+  1. Как вас зовут?
+  2. Сколько вам лет?
+  3. Из какого вы города?
+  4. Есть ли у вас опыт работы диспетчером или оператором?
+  5. Готовы ли вы работать в сменном графике (день/ночь)?
+  6. Когда вы готовы приступить к работе?
+После того как все вопросы заданы и получены ответы:
+- Поблагодарите кандидата
+- Скажите, что передадите информацию менеджеру
+- В ПОСЛЕДНЕМ сообщении добавьте в самом конце маркер: [CANDIDATE_READY]
+Если кандидат задаёт вопросы не по теме — вежливо верните к собеседованию.
+Если кандидат говорит, что не заинтересован — поблагодарите и попрощайтесь."""
 
 
-async def get_access_token():
-    if "access_token" in tokens:
-        return tokens["access_token"]
-    return None
+def parse_bitrix_form(data: dict) -> dict:
+    """Parse Bitrix24 form-data with nested keys like auth[access_token]."""
+    result = {}
+    for key, value in data.items():
+        if "[" in key:
+            parts = key.replace("]", "").split("[")
+            current = result
+            for part in parts[:-1]:
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+            current[parts[-1]] = value
+        else:
+            result[key] = value
+    return result
+
+
+async def parse_request_body(request: Request):
+    """Parse request body - handles both JSON and form-data."""
+    content_type = request.headers.get("content-type", "")
+    if "json" in content_type:
+        try:
+            return await request.json()
+        except Exception:
+            pass
+    try:
+        form = await request.form()
+        return dict(form)
+    except Exception:
+        pass
+    try:
+        body = await request.body()
+        return {"raw": body.decode("utf-8", errors="replace")}
+    except Exception:
+        return {}
 
 
 async def refresh_tokens():
     if "refresh_token" not in tokens:
         return False
-    async with httpx.AsyncClient() as client_http:
-        resp = await client_http.get(
+    async with httpx.AsyncClient() as c:
+        resp = await c.get(
             "https://oauth.bitrix.info/oauth/token/",
             params={
                 "grant_type": "refresh_token",
@@ -74,21 +105,21 @@ async def refresh_tokens():
 
 
 async def bitrix_call(method, params=None):
-    token = await get_access_token()
+    token = tokens.get("access_token")
     if not token:
-        logger.error("No access token available")
+        logger.error("No access token")
         return None
-    async with httpx.AsyncClient() as client_http:
-        resp = await client_http.post(
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.post(
             f"https://{BITRIX_PORTAL}/rest/{method}",
             params={"auth": token},
             json=params or {}
         )
         data = resp.json()
-        if "error" in data and data["error"] == "expired_token":
+        if data.get("error") == "expired_token":
             if await refresh_tokens():
-                token = await get_access_token()
-                resp = await client_http.post(
+                token = tokens.get("access_token")
+                resp = await c.post(
                     f"https://{BITRIX_PORTAL}/rest/{method}",
                     params={"auth": token},
                     json=params or {}
@@ -101,7 +132,6 @@ async def get_gpt_response(dialog_id, user_message):
     if dialog_id not in dialogs:
         dialogs[dialog_id] = []
     dialogs[dialog_id].append({"role": "user", "content": user_message})
-    # Keep last 20 messages
     if len(dialogs[dialog_id]) > 20:
         dialogs[dialog_id] = dialogs[dialog_id][-20:]
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + dialogs[dialog_id]
@@ -131,59 +161,31 @@ async def send_candidate_card(dialog_id, conversation):
         })
 
 
-def parse_bitrix_form(data: dict) -> dict:
-    """Parse Bitrix24 form-data with nested keys like auth[access_token]."""
-    result = {}
-    for key, value in data.items():
-        if "[" in key:
-            parts = key.replace("]", "").split("[")
-            current = result
-            for i, part in enumerate(parts[:-1]):
-                if part not in current:
-                    current[part] = {}
-                current = current[part]
-            current[parts[-1]] = value
-        else:
-            result[key] = value
-    return result
-
-
-async def parse_request_body(request: Request):
-    """Parse request body - handles both JSON and form-data."""
-    content_type = request.headers.get("content-type", "")
-    if "json" in content_type:
-        try:
-            return await request.json()
-        except Exception:
-            pass
-    if "form" in content_type or "urlencoded" in content_type:
-        form = await request.form()
-        return dict(form)
-    # Try JSON first, then form
-    try:
-        return await request.json()
-    except Exception:
-        try:
-            form = await request.form()
-            return dict(form)
-        except Exception:
-            body = await request.body()
-            return {"raw": body.decode("utf-8", errors="replace")}
+async def bind_events():
+    """Register event handlers after install."""
+    events = [
+        "OnOpenLineMessageAdd",
+    ]
+    for event in events:
+        result = await bitrix_call("event.bind", {
+            "event": event,
+            "handler": WEBHOOK_URL
+        })
+        logger.info(f"Bind {event}: {result}")
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "app": "AI Recruiter Avito"}
+    return {"status": "ok", "app": "AI Recruiter Avito", "tokens": bool(tokens.get("access_token"))}
 
 
 @app.get("/install")
 async def install_get(request: Request):
     code = request.query_params.get("code")
-    domain = request.query_params.get("domain")
     if not code:
         return HTMLResponse("<h1>Install: no code provided</h1>")
-    async with httpx.AsyncClient() as client_http:
-        resp = await client_http.get(
+    async with httpx.AsyncClient() as c:
+        resp = await c.get(
             "https://oauth.bitrix.info/oauth/token/",
             params={
                 "grant_type": "authorization_code",
@@ -193,97 +195,93 @@ async def install_get(request: Request):
             }
         )
         data = resp.json()
-        logger.info(f"Install GET response: {data}")
+    logger.info(f"Install GET: {data}")
     if "access_token" in data:
         tokens["access_token"] = data["access_token"]
         tokens["refresh_token"] = data["refresh_token"]
-        result = await bitrix_call("event.bind", {
-            "event": "ONIMBOTMESSAGEADD",
-            "handler": f"https://ai-recruiter-avito.onrender.com/webhook"
-        })
-        logger.info(f"Event bind result: {result}")
+        await bind_events()
         return HTMLResponse("<h1>App installed successfully!</h1>")
     return HTMLResponse(f"<h1>Install error</h1><pre>{json.dumps(data, indent=2)}</pre>")
 
 
 @app.post("/install")
 async def install_post(request: Request):
-    raw_body = await parse_request_body(request)
-    logger.info(f"Install POST raw body: {json.dumps(raw_body, default=str, ensure_ascii=False)[:500]}")
-    # Parse nested keys like auth[access_token]
-    body = parse_bitrix_form(raw_body)
-    logger.info(f"Install POST parsed body: {json.dumps(body, default=str, ensure_ascii=False)[:500]}")
-    # Bitrix sends auth data in nested format: auth[access_token], auth[refresh_token]
-    auth_data = body.get("auth", {})
-    access_token = None
-    refresh_token = None
-    if isinstance(auth_data, dict):
-        access_token = auth_data.get("access_token")
-        refresh_token = auth_data.get("refresh_token")
-    # Also try flat format
+    raw = await parse_request_body(request)
+    body = parse_bitrix_form(raw)
+    logger.info(f"Install POST: {json.dumps(body, default=str, ensure_ascii=False)[:600]}")
+
+    # Extract auth tokens — Bitrix sends auth[access_token] etc.
+    auth = body.get("auth", {})
+    access_token = auth.get("access_token") if isinstance(auth, dict) else None
+    refresh_token = auth.get("refresh_token") if isinstance(auth, dict) else None
+
+    # Fallback flat keys
     if not access_token:
         access_token = body.get("AUTH_ID") or body.get("auth_id")
         refresh_token = body.get("REFRESH_ID") or body.get("refresh_id")
+
     if access_token:
         tokens["access_token"] = access_token
         if refresh_token:
             tokens["refresh_token"] = refresh_token
-        logger.info(f"Tokens saved. Access token: {access_token[:10]}...")
-        # Register event handler for open lines messages
-        result = await bitrix_call("event.bind", {
-            "event": "ONIMBOTMESSAGEADD",
-            "handler": "https://ai-recruiter-avito.onrender.com/webhook"
-        })
-        logger.info(f"Event bind result: {result}")
+        logger.info(f"Token saved: {access_token[:15]}...")
+        await bind_events()
         return JSONResponse({"status": "ok"})
-    return JSONResponse({"status": "received", "body_keys": list(raw_body.keys())})
+
+    return JSONResponse({"status": "received", "keys": list(raw.keys())})
 
 
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
-        raw_body = await parse_request_body(request)
-        body = parse_bitrix_form(raw_body)
-        logger.info(f"Webhook received: {json.dumps(body, default=str, ensure_ascii=False)[:500]}")
+        raw = await parse_request_body(request)
+        body = parse_bitrix_form(raw)
+        logger.info(f"Webhook: {json.dumps(body, default=str, ensure_ascii=False)[:800]}")
 
-        # Refresh auth if provided
-        auth_data = body.get("auth", {})
-        if isinstance(auth_data, dict) and auth_data.get("access_token"):
-            tokens["access_token"] = auth_data["access_token"]
-            if auth_data.get("refresh_token"):
-                tokens["refresh_token"] = auth_data["refresh_token"]
+        # Always update tokens from webhook auth if provided
+        auth = body.get("auth", {})
+        if isinstance(auth, dict) and auth.get("access_token"):
+            tokens["access_token"] = auth["access_token"]
+            if auth.get("refresh_token"):
+                tokens["refresh_token"] = auth["refresh_token"]
 
-        event = body.get("event", "")
+        event = body.get("event", "").upper()
         data = body.get("data", {})
 
-        if event == "ONIMBOTMESSAGEADD" or "PARAMS" in data:
-            params = data.get("PARAMS", data)
-            dialog_id = str(params.get("DIALOG_ID", params.get("dialog_id", "")))
-            message = params.get("MESSAGE", params.get("message", ""))
+        # OnOpenLineMessageAdd — new message from client in Open Line
+        if event == "ONOPENLINEMESSAGEADD":
+            params = data.get("PARAMS", {})
+            dialog_id = str(params.get("DIALOG_ID", ""))
+            message = params.get("MESSAGE", "")
+            # Skip operator messages (FROM_CONNECTOR = N means from operator)
+            from_connector = params.get("FROM_CONNECTOR", "Y")
+            if from_connector == "N":
+                logger.info("Skipping operator message")
+                return JSONResponse({"status": "skip_operator"})
 
             if not message or not dialog_id:
-                return JSONResponse({"status": "no message"})
+                return JSONResponse({"status": "no_data"})
 
-            # Get GPT response
             gpt_response = await get_gpt_response(dialog_id, message)
 
-            # Check if candidate is ready
             if "[CANDIDATE_READY]" in gpt_response:
-                clean_response = gpt_response.replace("[CANDIDATE_READY]", "").strip()
-                await bitrix_call("im.message.add", {
+                clean = gpt_response.replace("[CANDIDATE_READY]", "").strip()
+                await bitrix_call("imopenlines.message.add", {
                     "DIALOG_ID": dialog_id,
-                    "MESSAGE": clean_response
+                    "MESSAGE": clean
                 })
                 await send_candidate_card(dialog_id, dialogs.get(dialog_id, []))
             else:
-                await bitrix_call("im.message.add", {
+                await bitrix_call("imopenlines.message.add", {
                     "DIALOG_ID": dialog_id,
                     "MESSAGE": gpt_response
                 })
 
             return JSONResponse({"status": "ok"})
 
-        return JSONResponse({"status": "unknown event", "event": event, "keys": list(body.keys())})
+        logger.info(f"Unknown event: {event}, keys: {list(body.keys())}")
+        return JSONResponse({"status": "unknown", "event": event})
+
     except Exception as e:
         logger.error(f"Webhook error: {e}", exc_info=True)
         return JSONResponse({"status": "error", "message": str(e)})
@@ -291,4 +289,8 @@ async def webhook(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "tokens": bool(tokens.get("access_token"))}
+    return {
+        "status": "healthy",
+        "has_token": bool(tokens.get("access_token")),
+        "dialogs_count": len(dialogs)
+    }
