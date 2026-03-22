@@ -346,10 +346,15 @@ async def old_webhook(request: Request, background_tasks: BackgroundTasks):
     logger.info(f"Bitrix24 event: {event}")
     logger.info(f"Bitrix24 form_data keys: {list(form_data.keys())}")
     logger.info(f"Bitrix24 raw body (first 500): {body[:500]}")
+        # Save Bitrix24 auth token if present
+    auth_token = form_data.get("auth[access_token]", [""])[0]
+    if auth_token:
+        tokens["access_token"] = auth_token
+        logger.info("Bitrix24 auth token updated from webhook event")
     if event == "ONOPENLINEMESSAGEADD":
         # Extract message text from Bitrix24 event
         chat_id = form_data.get("data[DATA][connector][chat_id]", [""])[0]
-        message_text = form_data.get("data[DATA][MESSAGES][0][message][text]", [""])[0]
+        message_text = form_data.get("data[DATA][message][text]", [""])[0]
         user_name = form_data.get("data[DATA][chat][name]", [""])[0]
         logger.info(f"Bitrix24 extracted: chat_id={chat_id}, message_text={message_text[:100] if message_text else 'NONE'}, user_name={user_name}")
         if chat_id and message_text:
