@@ -328,7 +328,7 @@ async def install_get(request: Request):
 async def old_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
         body = await request.body()
-        logger.info(f"POST /webhook body length={len(body)}")
+        logger.info(f"POST /webhook body length={len(body)}, body[:500]={body[:500]}")
         if not body:
             return {"status": "ok", "message": "empty body"}
         import json
