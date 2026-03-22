@@ -307,6 +307,32 @@ async def refresh_prompt():
     return {"status": "ok", "message": "Cache cleared, prompt will refresh on next message"}
 
 
+@app.get("/check-wazzup-webhook")
+async def check_wazzup_webhook():
+    """Check current Wazzup webhook settings."""
+    if not WAZZUP_API_KEY:
+        return {"error": "WAZZUP_API_KEY not configured"}
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            "https://api.wazzup24.com/v3/webhooks",
+            headers={"Authorization": "Bearer " + WAZZUP_API_KEY}
+        )
+        return {"status": response.status_code, "body": response.json()}
+
+@app.post("/setup-wazzup-webhook")
+async def setup_wazzup_webhook():
+    """Set Wazzup webhook to point to this server."""
+    if not WAZZUP_API_KEY:
+        return {"error": "WAZZUP_API_KEY not configured"}
+    webhook_url = "https://ai-recruiter-avito.onrender.com/wazzup-webhook"
+    async with httpx.AsyncClient() as client:
+        response = await client.patch(
+            "https://api.wazzup24.com/v3/webhooks",
+            headers={"Authorization": "Bearer " + WAZZUP_API_KEY, "Content-Type": "application/json"},
+            json={"webhooksUri": webhook_url, "subscriptions": {"messagesAndStatuses": True}}
+        )
+        return {"status": response.status_code, "body": response.text}
+
 @app.post("/install")
 async def install(request: Request):
     data = await request.form()
