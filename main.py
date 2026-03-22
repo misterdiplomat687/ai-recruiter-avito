@@ -326,7 +326,11 @@ async def install_get(request: Request):
 
 @app.post("/webhook")
 async def old_webhook(request: Request, background_tasks: BackgroundTasks):
-        return await wazzup_webhook(request, background_tasks)
+    body = await request.body()
+    logger.info(f"POST /webhook body length={len(body)}")
+    if not body:
+        return {"status": "ok", "message": "empty body"}
+    return await wazzup_webhook(request, background_tasks)
 
 
 # ============================================================
