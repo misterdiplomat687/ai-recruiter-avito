@@ -319,7 +319,7 @@ async def check_wazzup_webhook():
         )
         return {"status": response.status_code, "body": response.json()}
 
-@app.post("/setup-wazzup-webhook")
+@app.get("/setup-wazzup-webhook")
 async def setup_wazzup_webhook():
     """Set Wazzup webhook to point to this server."""
     if not WAZZUP_API_KEY:
