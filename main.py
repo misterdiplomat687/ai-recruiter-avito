@@ -325,8 +325,8 @@ async def install_get(request: Request):
 
 
 @app.post("/webhook")
-async def old_webhook(request: Request):
-    return {"status": "deprecated, use /wazzup-webhook"}
+async def old_webhook(request: Request, background_tasks: BackgroundTasks):
+        return await wazzup_webhook(request, background_tasks)
 
 
 # ============================================================
