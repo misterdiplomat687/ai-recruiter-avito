@@ -326,20 +326,38 @@ async def install_get(request: Request):
 
 @app.post("/webhook")
 async def old_webhook(request: Request, background_tasks: BackgroundTasks):
-    try:
-        body = await request.body()
-        logger.info(f"POST /webhook body length={len(body)}, body[:500]={body[:500]}")
-        if not body:
-            return {"status": "ok", "message": "empty body"}
+    content_type = request.headers.get("content-type", "")
+    body = await request.body()
+    logger.info(f"POST /webhook content_type={content_type}, body_len={len(body)}")
+    if not body:
+        return {"status": "ok", "message": "empty body"}
+    # Try JSON first (Wazzup format)
+    if "json" in content_type:
         import json
         data = json.loads(body)
         messages = data.get("messages", [])
         for msg in messages:
             background_tasks.add_task(process_wazzup_message, msg)
         return {"status": "ok"}
-    except Exception as e:
-        logger.error(f"Error in /webhook: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    # Form-urlencoded (Bitrix24 event) - parse and process
+    from urllib.parse import parse_qs
+    form_data = parse_qs(body.decode("utf-8"))
+    event = form_data.get("event", [""])[0]
+    logger.info(f"Bitrix24 event: {event}")
+    if event == "ONOPENLINEMESSAGEADD":
+        # Extract message text from Bitrix24 event
+        chat_id = form_data.get("data[DATA][connector][chat_id]", [""])[0]
+        message_text = form_data.get("data[DATA][MESSAGES][0][message][text]", [""])[0]
+        user_name = form_data.get("data[DATA][chat][name]", [""])[0]
+        if chat_id and message_text:
+            msg = {
+                "chatId": chat_id,
+                "text": message_text,
+                "chatType": "avito",
+                "type": "incoming"
+            }
+            background_tasks.add_task(process_wazzup_message, msg)
+    return {"status": "ok"}
 
 
 # ============================================================
