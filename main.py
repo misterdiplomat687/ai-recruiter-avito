@@ -326,11 +326,20 @@ async def install_get(request: Request):
 
 @app.post("/webhook")
 async def old_webhook(request: Request, background_tasks: BackgroundTasks):
-    body = await request.body()
-    logger.info(f"POST /webhook body length={len(body)}")
-    if not body:
-        return {"status": "ok", "message": "empty body"}
-    return await wazzup_webhook(request, background_tasks)
+    try:
+        body = await request.body()
+        logger.info(f"POST /webhook body length={len(body)}")
+        if not body:
+            return {"status": "ok", "message": "empty body"}
+        import json
+        data = json.loads(body)
+        messages = data.get("messages", [])
+        for msg in messages:
+            background_tasks.add_task(process_wazzup_message, msg)
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Error in /webhook: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================
