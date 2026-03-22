@@ -384,6 +384,8 @@ async def send_wazzup_message(chat_id, text):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(url, headers=headers, json=payload)
+            logger.info(f"Wazzup request payload: {payload}")
+            logger.info(f"Wazzup response status={response.status_code}, body={response.text[:500]}")
             response.raise_for_status()
             logger.info("Message sent to Wazzup chat " + chat_id)
         except Exception as e:
